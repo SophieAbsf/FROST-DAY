@@ -114,5 +114,5 @@ def calculate_frost_stats(df_meteo):
     
     stats_day = pd.merge(frost_by_day, total_years_by_day, on='month_day')
     stats_day['relatif'] = (stats_day['absolu'] / stats_day['total_years']) * 100
-    
+
     return total_frost_days, avg_frost_per_year, stats_day
