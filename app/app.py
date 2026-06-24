@@ -1,92 +1,147 @@
-import streamlit as st
-import pandas as pd
-import plotly.express as px
+from __future__ import annotations
+
 from datetime import date
 
-# Import direct sans préfixe "app." car les fichiers partagent le même répertoire
-from utils import get_city_coordinates, find_closest_valid_station, calculate_frost_stats
+import plotly.express as px
+import streamlit as st
 
-st.set_page_config(page_title="Défi Frost Days", page_icon="❄️", layout="wide")
+from frost_days.config import configure_logging
+from frost_days.departments import department_options, parse_department_option
+from frost_days.geo_api import Commune, list_communes
+from frost_days.public_data_client import PublicMeteoFranceClient
+from frost_days.stations import select_first_valid_station
+from frost_days.statistics import compute_statistics
 
-st.title("❄️ Application Frost Days")
-st.write("Analyse des indicateurs de jours de gel en temps réel pour une commune donnée.")
+configure_logging()
 
-# Chargement ou génération des données de référence (Communes et Stations) 
-@st.cache_data
-def load_reference_data():
-    # Note : Vous pouvez remplacer ce mock par pd.read_csv("votre_fichier.csv")
-    df_communes = pd.DataFrame({
-        'nom_commune': ['Paris', 'Marseille', 'Lyon', 'Culey', 'Bihorel'],
-        'code_departement': ['75', '13', '69', '55', '76'],
-        'latitude': [48.866, None, 45.75, 48.755, 49.4542], 
-        'longitude': [2.333, None, 4.85, 5.266, 1.1162]
-    })
-    
-    df_stations = pd.DataFrame({
-        'id_station': [75001, 13002, 69003, 55004],
-        'latitude': [48.85, 43.30, 45.76, 48.75],
-        'longitude': [2.35, 5.40, 4.83, 5.25]
-    })
-    return df_communes, df_stations
+st.set_page_config(page_title="Frost Days", layout="wide")
+st.title("Frost Days")
 
-df_communes, df_stations = load_reference_data()
+MIN_ALLOWED_DATE = date(2013, 1, 1)
+MAX_ALLOWED_DATE = date(2024, 12, 31)
 
-# Formulaire utilisateur (Barre latérale) 
-st.sidebar.header("Paramètres de recherche")
-commune_input = st.sidebar.text_input("Nom de la commune", value="Paris")
-dept_input = st.sidebar.text_input("Département", value="75")
 
-# Plage de dates de référence recommandée 
-start_date = st.sidebar.date_input("Date de début", date(2014, 1, 1))
-end_date = st.sidebar.date_input("Date de fin", date(2023, 12, 31))
+@st.cache_data(show_spinner=False)
+def cached_communes(department_code: str) -> list[Commune]:
+    return list_communes(department_code)
 
-if st.sidebar.button("Lancer l'analyse"):
-    if commune_input and dept_input:
-        
-        # 1. Récupération des coordonnées GPS de la commune
-        lat, lon = get_city_coordinates(df_communes, commune_input, dept_input)
-        
-        if lat is None or lon is None:
-            st.error(f"❌ Impossible de localiser la commune '{commune_input}' ({dept_input}).")
-        else:
-            st.info(f"📍 Ville localisée : Latitude {lat:.4f}, Longitude {lon:.4f}")
-            
-            # 2. Recherche en temps réel de la station la plus proche et valide
-            with st.spinner("Recherche de la station la plus proche (< 35% de données manquantes)..."):
-                id_station, df_meteo, missing_pct = find_closest_valid_station(df_stations, lat, lon, start_date, end_date)
-                
-            if id_station is None:
-                st.error("❌ Aucune station valide n'a été trouvée à proximité sous le seuil requis de données.")
-            else:
-                st.success(f"🎯 Station sélectionnée : ID {id_station} ({missing_pct:.1f}% de données manquantes)")
-                
-                # 3. Calcul de l'ensemble des statistiques de gel 
-                total_frost, avg_frost, stats_day = calculate_frost_stats(df_meteo)
-                
-                # 4. Affichage des indicateurs de performance clés (KPI) 
-                st.subheader(f"📊 Statistiques de Gel pour {commune_input}")
-                col1, col2 = st.columns(2)
-                col1.metric("Nombre total de jours de gel", value=total_frost)
-                col2.metric("Moyenne annuelle", value=f"{avg_frost:.2f} jours/an")
-                
-                # 5. Graphique interactif (Valeurs relatives %) 
-                st.markdown("---")
-                st.subheader("📅 Risque historique de gel par jour de l'année (%)")
-                
-                fig = px.bar(
-                    stats_day,
-                    x='month_day',
-                    y='relatif',
-                    title="Probabilité d'avoir un jour de gel sur la période sélectionnée",
-                    labels={'month_day': "Date (MM-JJ)", 'relatif': "Fréquence de gel (%)"},
-                    color_discrete_sequence=['#3399FF']
-                )
-                st.plotly_chart(fig, use_container_width=True)
-                
-                # 6. Tableau complet des données brutes 
-                with st.expander("Consulter le tableau détaillé (Valeurs Absolues et Relatives)"):
-                    st.dataframe(stats_day[['month_day', 'absolu', 'relatif']].rename(
-                        columns={'month_day': 'Jour', 'absolu': 'Total Absolu (Occurrences)', 'relatif': 'Taux Relatif (%)'}
-                    ))
-    else:
-        st.warning("⚠️ Veuillez renseigner le nom de la commune et son département.")
+
+department_choice = st.sidebar.selectbox(
+    "Departement",
+    options=department_options(),
+    index=20,
+)
+department = parse_department_option(department_choice)
+
+try:
+    communes = cached_communes(department)
+except Exception as exc:
+    st.sidebar.error(f"Impossible de charger les communes: {exc}")
+    st.stop()
+
+commune_labels = [f"{commune.name} ({commune.code})" for commune in communes]
+default_index = next(
+    (index for index, commune in enumerate(communes) if commune.name.casefold() == "dijon"),
+    0,
+)
+
+with st.sidebar.form("frost-days-form"):
+    st.header("Recherche")
+    commune_index = st.selectbox(
+        "Commune",
+        options=range(len(communes)),
+        index=default_index,
+        format_func=lambda index: commune_labels[index],
+    )
+    start_date = st.date_input(
+        "Date de debut",
+        MIN_ALLOWED_DATE,
+        min_value=MIN_ALLOWED_DATE,
+        max_value=MAX_ALLOWED_DATE,
+    )
+    end_date = st.date_input(
+        "Date de fin",
+        MAX_ALLOWED_DATE,
+        min_value=MIN_ALLOWED_DATE,
+        max_value=MAX_ALLOWED_DATE,
+    )
+    submitted = st.form_submit_button("Calculer")
+
+if not submitted:
+    st.info("Renseignez une commune, un departement et une periode pour lancer le calcul.")
+    st.stop()
+
+if start_date > end_date:
+    st.error("La date de debut doit etre anterieure ou egale a la date de fin.")
+    st.stop()
+
+if start_date < MIN_ALLOWED_DATE or end_date > MAX_ALLOWED_DATE:
+    st.error("Les donnees doivent rester entre 2013-01-01 et 2024-12-31.")
+    st.stop()
+
+try:
+    commune = communes[commune_index]
+
+    with st.spinner("Telechargement des donnees publiques Meteo-France du departement..."):
+        client = PublicMeteoFranceClient()
+        stations = client.list_daily_stations(commune.department, start_date, end_date)
+
+    with st.spinner("Recherche de la station valide la plus proche..."):
+        selected = select_first_valid_station(
+            stations=stations,
+            client=client,
+            commune_latitude=commune.latitude,
+            commune_longitude=commune.longitude,
+            start=start_date,
+            end=end_date,
+        )
+
+    stats = compute_statistics(selected.prepared.data)
+
+except Exception as exc:
+    st.error(str(exc))
+    st.stop()
+
+st.subheader(f"{commune.name} ({commune.department})")
+
+station_col, distance_col, missing_col = st.columns(3)
+station_col.metric("Station utilisee", f"{selected.station_name} ({selected.station_id})")
+distance_col.metric("Distance station-commune", f"{selected.distance_km:.1f} km")
+missing_col.metric("Donnees manquantes", f"{selected.missing_rate:.1f} %")
+
+total_col, average_col = st.columns(2)
+total_col.metric("Nombre total de jours de gel", f"{stats.total_frost_days}")
+average_col.metric("Moyenne annuelle", f"{stats.average_frost_days_per_year:.1f} jours/an")
+
+st.subheader("Jours de gel par annee")
+fig_year = px.bar(
+    stats.yearly,
+    x="year",
+    y="frost_days",
+    labels={"year": "Annee", "frost_days": "Jours de gel"},
+)
+fig_year.update_xaxes(dtick=1)
+st.plotly_chart(fig_year, use_container_width=True)
+
+st.subheader("Probabilite de gel par jour de l'annee")
+fig_day = px.line(
+    stats.daily,
+    x="month_day",
+    y="frost_probability_pct",
+    labels={
+        "month_day": "Jour de l'annee",
+        "frost_probability_pct": "Probabilite de gel (%)",
+    },
+)
+fig_day.update_xaxes(type="category", tickangle=45)
+st.plotly_chart(fig_day, use_container_width=True)
+
+export = selected.prepared.data.copy()
+export["date"] = export["date"].dt.strftime("%Y-%m-%d")
+st.download_button(
+    "Telecharger les donnees en CSV",
+    data=export.to_csv(index=False).encode("utf-8"),
+    file_name=f"frost_days_{commune.code}_{start_date}_{end_date}.csv",
+    mime="text/csv",
+)
+st.dataframe(export, use_container_width=True)
