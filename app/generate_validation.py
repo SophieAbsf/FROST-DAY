@@ -1,36 +1,3 @@
-"""
-generate_validation.py
-=======================
-
-Genere les 8 fichiers "_complete.csv" demandes par le professeur, a placer
-dans un dossier "validation/" a la racine du projet.
-
-Fichiers produits
-------------------
-  validation/stations_df_complete.csv          (~3000 stations : id, nom)
-  validation/city_df_complete.csv              (~35000 communes -> station la + proche)
-  validation/Paris_75_complete.csv             ) donnees quotidiennes 2013-2024
-  validation/Marseille_13_complete.csv         ) de la station la plus proche
-  validation/Digne-les-Bains_04_complete.csv   ) de la commune, avec frost_day
-  validation/Espinchal_63_complete.csv         )
-  validation/Montfalcon_38_complete.csv        )
-  validation/Asnieres-sur-Saone_01_complete.csv)
-
-Ce script est un traitement par LOT (batch), separe de l'application Streamlit.
-Il a besoin, en local :
-  1. des fichiers quotidiens Meteo-France RR-T-Vent decompresses (un par dept),
-  2. du fichier de reference des communes (data.gouv "communes-et-villes...").
-Il NE telecharge rien : adapte les chemins dans la section CONFIG ci-dessous.
-
-Logique (verifiee sur les fichiers de validation fournis par le prof) :
-  - station la plus proche = plus proche a vol d'oiseau (Haversine / KDTree),
-    calculee sur TOUTES les stations, pas seulement celles du departement ;
-  - meme station pour city_df et pour le fichier meteo de la commune ;
-  - frost_day = (tmin <= 0), valeur manquante -> False ;
-  - periode : 2013-01-01 a 2024-12-31 (12 ans) ;
-  - station_id : entier dans les fichiers meteo, chaine 8 car. ("01028001")
-    dans stations_df_complete et dans city_df (colonne closest_station_num_poste).
-"""
 
 from __future__ import annotations
 import glob
@@ -41,9 +8,6 @@ import pandas as pd
 from frost_validation import (build_export, build_station_catalogue,
                               SOURCE_CANDIDATES, _pick)
 
-# ============================ CONFIG (a adapter) ============================
-# Dossier contenant les CSV(.gz) quotidiens Meteo-France, un fichier par dept.
-# C'est le dossier rempli par download_all.py.
 METEO_DIR = "data/meteo"
 # Fichier de reference des communes (communes-france-2026.csv).
 COMMUNES_CSV = "data/communes/communes-france-2026.csv"
@@ -52,15 +16,8 @@ START, END = "2013-01-01", "2024-12-31"
 # Dossier de sortie.
 OUT_DIR = "validation"
 
-# Filtre du catalogue stations_df : on garde les stations ayant au plus ce
-# taux de jours manquants (TN absent) sur la periode. ATTENTION : ce seuil
-# N'EST PAS la regle des 35 % (celle-ci sert au choix de station d'une
-# commune). Sur le dept 01, le prof garde des stations jusqu'a ~56 % manquant
-# et rejette a partir de ~77 %. Valeur a CONFIRMER avec l'enseignant.
 CATALOGUE_MAX_MISSING = 0.65
 
-# Communes a exporter en detail. Cle = (nom officiel exact, dep) ; valeur =
-# prefixe du fichier (le prof utilise les noms accentues dans ses fichiers).
 TARGET_COMMUNES = {
     ("Paris", "75"):                "Paris_75",
     ("Marseille", "13"):            "Marseille_13",
@@ -80,11 +37,6 @@ MISSING_CITIES_LAT_LON = {
 }
 
 
-# ============================ Outils geographiques ============================
-# Recherche du plus proche voisin SANS scipy (non present dans requirements.txt).
-# On projette (lat, lon) sur la sphere unite : le plus grand produit scalaire
-# correspond au plus petit angle, donc a la station la plus proche a vol
-# d'oiseau -- exactement comme la formule de Haversine de frost_days/distance.py.
 def _unit_vectors(lat, lon):
     la, lo = np.radians(lat), np.radians(lon)
     return np.column_stack([np.cos(la) * np.cos(lo),
@@ -115,9 +67,6 @@ def nearest_station(communes: pd.DataFrame, stations: pd.DataFrame) -> pd.DataFr
     return out
 
 
-# ============================ Lecture Meteo-France ============================
-# Cache local du DataFrame meteo concatene : la lecture des .gz ne se fait
-# qu'une fois. Supprime ce fichier si tu changes la periode ou les donnees.
 METEO_CACHE = "data/_meteo_cache.pkl"
 
 
@@ -175,10 +124,6 @@ def station_table(meteo: pd.DataFrame) -> pd.DataFrame:
     return st
 
 
-# ============================ Lecture des communes ============================
-# Correspondance colonnes du fichier communes-france-2026.csv -> noms attendus.
-# (latitude_centre/longitude_centre = coordonnees du centre, celles qu'utilise
-# le prof ; elles correspondent exactement a son city_df.)
 COMMUNES_COLUMN_MAP = {
     "code_insee": "insee_code",
     "nom_standard": "name",
@@ -213,25 +158,43 @@ def load_communes() -> pd.DataFrame:
 
 
 # ============================ Generation ============================
+def stations_with_data(meteo: pd.DataFrame) -> pd.DataFrame:
+    """Stations candidates = celles ayant AU MOINS une valeur TN sur la periode
+    (id 8 car., name, lat, lon). Pas de seuil : le filtrage se fait ensuite
+    naturellement (une station n'est gardee que si elle est la plus proche
+    d'au moins une commune)."""
+    sid = _pick(meteo, SOURCE_CANDIDATES["station_id"])
+    tn = _pick(meteo, SOURCE_CANDIDATES["tmin"])
+    has_tn = meteo.groupby(sid)[tn].apply(lambda s: s.notna().any())
+    keep = set(has_tn[has_tn].index)
+    st = station_table(meteo)
+    sid8 = pd.to_numeric(pd.Series(list(keep)), errors="coerce").astype("Int64").astype(str).str.zfill(8)
+    return st[st["id"].isin(set(sid8))].reset_index(drop=True)
+
+
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     print("1/4 Lecture des fichiers Meteo-France...")
     meteo = load_meteo_files()
 
-    print("2/4 stations_df_complete.csv ...")
-    catalogue = build_catalogue_filtered(meteo)                # filtre couverture
-    catalogue.to_csv(os.path.join(OUT_DIR, "stations_df_complete.csv"), index=False)
-    print(f"      {len(catalogue)} stations (seuil manquant <= {CATALOGUE_MAX_MISSING:.0%})")
-
-    print("3/4 city_df_complete.csv ...")
-    stations = station_table(meteo)
-    stations = stations[stations["id"].isin(set(catalogue["station_id"]))]  # memes stations que le catalogue
+    print("2/4 city_df_complete.csv (station la plus proche de chaque commune) ...")
+    stations = stations_with_data(meteo)
     communes = load_communes()
     city = nearest_station(communes, stations)
     city = city[["insee_code", "name", "dep_code", "dep_name", "lat", "lon",
                  "closest_station_name", "closest_station_num_poste", "station_dept"]]
     city.to_csv(os.path.join(OUT_DIR, "city_df_complete.csv"), index=False)
     print(f"      {len(city)} communes")
+
+    print("3/4 stations_df_complete.csv (stations effectivement utilisees) ...")
+    catalogue = (city[["closest_station_num_poste", "closest_station_name"]]
+                 .drop_duplicates()
+                 .rename(columns={"closest_station_num_poste": "station_id",
+                                  "closest_station_name": "station_name"})
+                 .sort_values("station_id")
+                 .reset_index(drop=True))
+    catalogue.to_csv(os.path.join(OUT_DIR, "stations_df_complete.csv"), index=False)
+    print(f"      {len(catalogue)} stations (= nb de stations utilisees par city_df)")
 
     print("4/4 fichiers meteo par commune ...")
     sid_col = _pick(meteo, SOURCE_CANDIDATES["station_id"])
